@@ -1,0 +1,5 @@
+# No external dependencies required for basic functionality
+# Core functionality uses only Python standard library 
+colorama>=0.4.6  # Cross-platform colored terminal output 
+openai>=1.3.5  # OpenAI API client
+python-dotenv>=1.0.0  # Environment variable management 

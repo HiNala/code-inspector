@@ -1,0 +1,78 @@
+# Environment variables and secrets
+.env
+.env.*
+*.env
+credentials.json
+google_credentials.json
+*_credentials.json
+secrets/
+.secret*
+api_keys.txt
+*_key*
+*_token*
+
+# Cache directories
+cache/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Output directories and files
+output/
+summaries/
+summary_*/
+file_paths_*.txt
+*.summary.md
+*.md
+!README*.md
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Index files
+kb.index
+*.faiss
+*.npy
+*.pkl
+
+# Logs and temporary files
+*.log
+logs/
+temp/
+tmp/
+*.tmp
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.vs/
+*.sublime-*
+
+# OS specific files
+.DS_Store
+Thumbs.db
+*.bak
+Desktop.ini
+$RECYCLE.BIN/
+
+# Virtual environment
+venv/
+env/
+.env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST 
