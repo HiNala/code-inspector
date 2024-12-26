@@ -1,111 +1,181 @@
 """Speech-to-Text functionality using SpeechRecognition."""
 
 import os
+import time
 import speech_recognition as sr
+from typing import Optional, Dict
 from colorama import Fore, Style
 from halo import Halo
-import keyboard
-import time
 from dotenv import load_dotenv
+import keyboard
+import pocketsphinx
 
 # Load environment variables
 load_dotenv()
 
-# Configuration
-STT_TIMEOUT = int(os.getenv("STT_TIMEOUT", "10"))  # Default 10 seconds
-AMBIENT_DURATION = float(os.getenv("AMBIENT_DURATION", "1.0"))  # Default 1 second
-ENERGY_THRESHOLD = int(os.getenv("ENERGY_THRESHOLD", "4000"))  # Default 4000
+# Constants
+DEFAULT_TIMEOUT = int(os.getenv("STT_TIMEOUT", "10"))
+DEFAULT_AMBIENT_DURATION = float(os.getenv("AMBIENT_DURATION", "1.0"))
+DEFAULT_ENERGY_THRESHOLD = int(os.getenv("ENERGY_THRESHOLD", "4000"))
+MAX_RETRIES = 3
+RETRY_DELAY = 2
 
-def check_microphone() -> tuple[bool, str]:
-    """
-    Check if a working microphone is available.
-    
-    Returns:
-        tuple[bool, str]: (success, message)
-    """
-    try:
-        mic_list = sr.Microphone.list_microphone_names()
-        if not mic_list:
-            return False, "No microphones found"
-        
-        # Try to initialize microphone
-        with sr.Microphone() as source:
-            return True, f"Found microphone: {source.device_index}"
+class STTManager:
+    def __init__(self):
+        """Initialize the STT manager with error handling."""
+        try:
+            self.recognizer = sr.Recognizer()
+            self.microphone = sr.Microphone()
+            self.offline_engine = None
+            self._setup_offline_engine()
             
-    except Exception as e:
-        return False, f"Error checking microphone: {str(e)}"
-
-def transcribe_speech_to_text(timeout: int = STT_TIMEOUT) -> str:
-    """
-    Transcribe audio input to text using SpeechRecognition.
-    
-    Args:
-        timeout (int): Maximum time to listen for speech in seconds
-        
-    Returns:
-        str: The transcribed text or empty string if failed
-    """
-    # Check microphone first
-    mic_ok, mic_msg = check_microphone()
-    if not mic_ok:
-        print(f"{Fore.RED}Microphone error: {mic_msg}{Style.RESET_ALL}")
-        return ""
-    
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = ENERGY_THRESHOLD  # Adjust sensitivity
-    
-    try:
-        with sr.Microphone() as source:
-            # Adjust for ambient noise
-            print(f"\n{Fore.CYAN}Adjusting for ambient noise...{Style.RESET_ALL}")
-            recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_DURATION)
+            # Configure recognizer
+            with self.microphone as source:
+                self.recognizer.energy_threshold = DEFAULT_ENERGY_THRESHOLD
+                self.adjust_for_ambient_noise(duration=DEFAULT_AMBIENT_DURATION)
+                
+        except Exception as e:
+            print(f"{Fore.RED}Error initializing STT: {str(e)}{Style.RESET_ALL}")
+            print("Please check your microphone connection and permissions.")
+            raise
             
-            with Halo(text='Listening... Press Enter when done or Esc to cancel', spinner='dots') as spinner:
-                try:
-                    # Start listening
-                    spinner.text = 'Listening... (Speak now)'
-                    audio = recognizer.listen(source, timeout=timeout)
+    def _setup_offline_engine(self):
+        """Set up offline speech recognition engine."""
+        try:
+            self.offline_engine = pocketsphinx.Pocketsphinx()
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: Offline STT engine not available: {str(e)}{Style.RESET_ALL}")
+            
+    def adjust_for_ambient_noise(self, duration: float = DEFAULT_AMBIENT_DURATION) -> None:
+        """Adjust microphone for ambient noise with visual feedback."""
+        try:
+            with Halo(text='Adjusting for ambient noise...', spinner='dots') as spinner:
+                with self.microphone as source:
+                    self.recognizer.adjust_for_ambient_noise(source, duration=duration)
+                spinner.succeed('Microphone adjusted successfully')
+        except Exception as e:
+            print(f"{Fore.RED}Error adjusting microphone: {str(e)}{Style.RESET_ALL}")
+            raise
+            
+    def listen(self, timeout: int = DEFAULT_TIMEOUT, show_progress: bool = True) -> Optional[str]:
+        """Listen for speech with progress indicator and error handling."""
+        try:
+            with self.microphone as source:
+                if show_progress:
+                    print(f"\n{Fore.CYAN}Listening... (Press 'Esc' to cancel){Style.RESET_ALL}")
                     
-                    # Wait for user to press Enter or Esc
+                # Start listening with timeout
+                start_time = time.time()
+                audio = None
+                
+                with Halo(text='Listening...', spinner='dots') as spinner:
                     while True:
-                        if keyboard.is_pressed('enter'):
-                            break
-                        if keyboard.is_pressed('esc'):
-                            print(f"\n{Fore.YELLOW}Transcription cancelled.{Style.RESET_ALL}")
-                            return ""
-                        time.sleep(0.1)
-                    
-                    # Try multiple recognition services
-                    spinner.text = 'Transcribing...'
-                    
-                    # Try Google Speech Recognition first
-                    try:
-                        text = recognizer.recognize_google(audio)
-                        spinner.succeed(f"Transcribed: {text}")
-                        return text
-                    except sr.RequestError:
-                        # If Google fails, try Sphinx (offline)
                         try:
-                            text = recognizer.recognize_sphinx(audio)
-                            spinner.succeed(f"Transcribed (offline): {text}")
+                            # Check for Esc key
+                            if keyboard.is_pressed('esc'):
+                                spinner.fail('Listening cancelled')
+                                return None
+                                
+                            # Update progress
+                            elapsed = time.time() - start_time
+                            remaining = timeout - elapsed
+                            if remaining <= 0:
+                                spinner.fail('Listening timeout')
+                                return None
+                                
+                            spinner.text = f'Listening... ({remaining:.1f}s remaining)'
+                            
+                            # Try to get audio with a short timeout
+                            audio = self.recognizer.listen(source, timeout=1)
+                            if audio:
+                                spinner.succeed('Audio captured successfully')
+                                break
+                                
+                        except sr.WaitTimeoutError:
+                            continue
+                            
+                if not audio:
+                    return None
+                    
+                # Try to recognize speech
+                with Halo(text='Processing speech...', spinner='dots') as spinner:
+                    for attempt in range(MAX_RETRIES):
+                        try:
+                            # Try Google Speech Recognition
+                            text = self.recognizer.recognize_google(audio)
+                            spinner.succeed('Speech processed successfully')
                             return text
-                        except Exception as e:
-                            spinner.fail(f"All recognition services failed")
-                            return ""
-                    
-                except sr.WaitTimeoutError:
-                    spinner.fail("Listening timed out. No speech detected.")
-                    return ""
-                except sr.UnknownValueError:
-                    spinner.fail("Could not understand the audio. Please try again.")
-                    return ""
-                    
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "no default input device available" in error_msg:
-            print(f"{Fore.RED}Error: No microphone found. Please check your microphone settings.{Style.RESET_ALL}")
-        elif "access denied" in error_msg:
-            print(f"{Fore.RED}Error: Microphone access denied. Please check your permissions.{Style.RESET_ALL}")
+                            
+                        except sr.RequestError:
+                            # Try offline recognition
+                            if self.offline_engine:
+                                try:
+                                    text = self.offline_engine.decode(audio.get_raw_data())
+                                    spinner.succeed('Speech processed offline')
+                                    return text
+                                except Exception:
+                                    pass
+                                    
+                            if attempt < MAX_RETRIES - 1:
+                                spinner.text = f'Retrying... ({attempt + 1}/{MAX_RETRIES})'
+                                time.sleep(RETRY_DELAY)
+                            else:
+                                spinner.fail('Speech recognition failed')
+                                print(f"{Fore.RED}Error: Could not connect to speech recognition service{Style.RESET_ALL}")
+                                return None
+                                
+                        except sr.UnknownValueError:
+                            spinner.fail('Speech not understood')
+                            print(f"{Fore.YELLOW}Could not understand audio{Style.RESET_ALL}")
+                            return None
+                            
+        except Exception as e:
+            print(f"{Fore.RED}Error during speech recognition: {str(e)}{Style.RESET_ALL}")
+            return None
+            
+    def get_supported_languages(self) -> Dict[str, str]:
+        """Get list of supported languages with error handling."""
+        try:
+            # This is a placeholder - actual implementation would depend on the
+            # speech recognition service being used
+            return {
+                "en-US": "English (United States)",
+                "en-GB": "English (United Kingdom)",
+                "es-ES": "Spanish (Spain)",
+                "fr-FR": "French (France)",
+                "de-DE": "German (Germany)"
+            }
+        except Exception as e:
+            print(f"{Fore.RED}Error getting supported languages: {str(e)}{Style.RESET_ALL}")
+            return {}
+            
+    def cleanup(self):
+        """Clean up resources."""
+        try:
+            if self.offline_engine:
+                self.offline_engine.cleanup()
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: Error during cleanup: {str(e)}{Style.RESET_ALL}")
+            
+def test_microphone() -> bool:
+    """Test microphone functionality."""
+    try:
+        manager = STTManager()
+        print(f"\n{Fore.CYAN}Testing microphone...{Style.RESET_ALL}")
+        print("Please say something...")
+        
+        text = manager.listen(timeout=5)
+        if text:
+            print(f"\n{Fore.GREEN}Microphone test successful!{Style.RESET_ALL}")
+            print(f"Recognized text: {text}")
+            return True
         else:
-            print(f"{Fore.RED}Error during transcription: {str(e)}{Style.RESET_ALL}")
-        return "" 
+            print(f"\n{Fore.RED}Microphone test failed{Style.RESET_ALL}")
+            return False
+            
+    except Exception as e:
+        print(f"{Fore.RED}Error testing microphone: {str(e)}{Style.RESET_ALL}")
+        return False
+    finally:
+        if 'manager' in locals():
+            manager.cleanup() 

@@ -4,29 +4,38 @@ import os
 import json
 import numpy as np
 import faiss
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Generator
 from openai import OpenAI
 from colorama import init, Fore, Style
 from dotenv import load_dotenv
 import re
 from halo import Halo
 import tiktoken
+from tqdm import tqdm
+import time
+from pathlib import Path
+import hashlib
 
 # Initialize colorama
 init(autoreset=True)
 
 # Load environment variables
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Constants
 EMBEDDING_MODEL = "text-embedding-ada-002"
-EMBEDDING_CTX_LENGTH = 8191  # Maximum context length for text-embedding-ada-002
+EMBEDDING_CTX_LENGTH = 8191
+BATCH_SIZE = 10  # Number of files to process at once
+MAX_RETRIES = 3  # Maximum number of API call retries
+RETRY_DELAY = 2  # Seconds to wait between retries
+MAX_CACHE_SIZE_GB = 2  # Maximum cache size in GB
 
 class KnowledgeBase:
-    def __init__(self, summary_dir: str, model: str = "gpt-3.5-turbo"):
+    def __init__(self, summary_dir: str, model: str = "gpt-3.5-turbo", cache_dir: str = "cache/embeddings"):
         self.summary_dir = summary_dir
         self.model = model
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.client = OpenAI()
         self.index = None
         self.embeddings = None
@@ -35,59 +44,91 @@ class KnowledgeBase:
         self.embedding_tokens_used = 0
         self.enc = tiktoken.encoding_for_model(EMBEDDING_MODEL)
         
-    def initialize(self) -> bool:
-        """Initialize the knowledge base by loading summaries and building the search index."""
-        try:
-            # Load all summary files
-            summary_files = []
-            for root, _, files in os.walk(self.summary_dir):
-                for file in files:
-                    if file.endswith('.md'):
-                        summary_files.append(os.path.join(root, file))
+    def _batch_generator(self, items: list, batch_size: int) -> Generator:
+        """Generate batches of items."""
+        for i in range(0, len(items), batch_size):
+            yield items[i:i + batch_size]
             
+    def _manage_cache_size(self):
+        """Ensure cache directory doesn't exceed MAX_CACHE_SIZE_GB."""
+        total_size = 0
+        cache_files = []
+        
+        # Get all cache files with their sizes and timestamps
+        for file in self.cache_dir.glob("*.npy"):
+            stats = file.stat()
+            total_size += stats.st_size
+            cache_files.append((file, stats.st_mtime))
+            
+        # If cache exceeds limit, remove oldest files until under limit
+        if total_size > MAX_CACHE_SIZE_GB * 1024**3:
+            cache_files.sort(key=lambda x: x[1])  # Sort by modification time
+            for file, _ in cache_files:
+                file.unlink()
+                total_size -= file.stat().st_size
+                print(f"{Fore.YELLOW}Removed old cache file: {file.name}{Style.RESET_ALL}")
+                if total_size <= MAX_CACHE_SIZE_GB * 1024**3:
+                    break
+                    
+    def _api_call_with_retry(self, func, *args, **kwargs):
+        """Make API calls with retry logic."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:
+                    raise e
+                print(f"{Fore.YELLOW}API call failed, retrying in {RETRY_DELAY}s... ({attempt + 1}/{MAX_RETRIES}){Style.RESET_ALL}")
+                time.sleep(RETRY_DELAY)
+
+    def initialize(self) -> bool:
+        """Initialize the knowledge base with improved memory management."""
+        try:
+            # Find all summary files
+            summary_files = list(Path(self.summary_dir).rglob("*.md"))
             if not summary_files:
                 print(f"{Fore.RED}No summary files found in {self.summary_dir}{Style.RESET_ALL}")
                 return False
-            
+                
             print(f"\nFound {len(summary_files)} summary files...")
             
-            # Load summaries and metadata
-            with Halo(text='Loading summaries...', spinner='dots') as spinner:
-                for i, file_path in enumerate(summary_files, 1):
-                    spinner.text = f"Loading summaries... ({i}/{len(summary_files)})"
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        
-                    # Extract metadata from the first line if it exists
-                    lines = content.split('\n')
-                    metadata = {}
-                    if lines and lines[0].startswith('Original file:'):
-                        original_file = lines[0].replace('Original file:', '').strip()
-                        metadata['original_file'] = original_file
-                        metadata['file_type'] = os.path.splitext(original_file)[1]
-                        metadata['directory'] = os.path.dirname(original_file)
-                        content = '\n'.join(lines[1:])
+            # Process files in batches
+            with tqdm(total=len(summary_files), desc="Loading summaries") as pbar:
+                for batch in self._batch_generator(summary_files, BATCH_SIZE):
+                    batch_summaries = []
+                    batch_metadata = {}
                     
-                    self.summaries.append(content)
-                    self.metadata[len(self.summaries) - 1] = metadata
-                spinner.succeed("Summaries loaded successfully")
-            
-            # Generate embeddings
-            print(f"\n{Fore.CYAN}Generating embeddings using {EMBEDDING_MODEL}...{Style.RESET_ALL}")
-            texts = [self._preprocess_text(summary) for summary in self.summaries]
-            
-            with Halo(text='Processing embeddings...', spinner='dots') as spinner:
-                self.embeddings = self._generate_embeddings(texts, spinner)
-                if self.embeddings.size == 0:
-                    return False
-                spinner.succeed(f"Embeddings generated successfully (Used {self.embedding_tokens_used:,} tokens)")
-            
+                    for file_path in batch:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            
+                        # Extract and store metadata
+                        lines = content.split('\n')
+                        metadata = self._extract_metadata(lines)
+                        idx = len(self.summaries)
+                        self.metadata[idx] = metadata
+                        
+                        # Store summary
+                        summary = '\n'.join(lines[1:]) if metadata else content
+                        self.summaries.append(summary)
+                        batch_summaries.append(summary)
+                        
+                        pbar.update(1)
+                        
+                    # Generate embeddings for batch
+                    if batch_summaries:
+                        self._process_batch_embeddings(batch_summaries)
+                        
             # Build FAISS index
             with Halo(text='Building search index...', spinner='dots') as spinner:
+                if self.embeddings is None:
+                    self.embeddings = np.concatenate([
+                        np.load(f) for f in sorted(self.cache_dir.glob("*.npy"))
+                    ])
                 self.index = faiss.IndexFlatL2(self.embeddings.shape[1])
                 self.index.add(self.embeddings)
                 spinner.succeed("Search index built successfully")
-            
+                
             print(f"\n{Fore.GREEN}Knowledge base initialized successfully!{Style.RESET_ALL}")
             print(f"Total embedding tokens used: {self.embedding_tokens_used:,}")
             return True
@@ -95,6 +136,51 @@ class KnowledgeBase:
         except Exception as e:
             print(f"{Fore.RED}Error initializing knowledge base: {str(e)}{Style.RESET_ALL}")
             return False
+            
+    def _process_batch_embeddings(self, texts: List[str]):
+        """Process embeddings for a batch of texts with caching."""
+        try:
+            # Generate cache key for batch
+            cache_key = hashlib.md5(''.join(texts).encode()).hexdigest()
+            cache_file = self.cache_dir / f"emb_{cache_key}.npy"
+            
+            if cache_file.exists():
+                # Load from cache
+                batch_embeddings = np.load(cache_file)
+            else:
+                # Generate new embeddings
+                processed_texts = [self._preprocess_text(text) for text in texts]
+                embeddings = []
+                
+                for text in processed_texts:
+                    tokens = self.enc.encode(text)
+                    self.embedding_tokens_used += len(tokens)
+                    
+                    if len(tokens) > EMBEDDING_CTX_LENGTH:
+                        text = self.enc.decode(tokens[:EMBEDDING_CTX_LENGTH])
+                        
+                    response = self._api_call_with_retry(
+                        self.client.embeddings.create,
+                        model=EMBEDDING_MODEL,
+                        input=text
+                    )
+                    embeddings.append(response.data[0].embedding)
+                    
+                batch_embeddings = np.array(embeddings, dtype=np.float32)
+                
+                # Save to cache
+                np.save(cache_file, batch_embeddings)
+                self._manage_cache_size()
+                
+            # Append to main embeddings array
+            if self.embeddings is None:
+                self.embeddings = batch_embeddings
+            else:
+                self.embeddings = np.concatenate([self.embeddings, batch_embeddings])
+                
+        except Exception as e:
+            print(f"{Fore.RED}Error processing batch embeddings: {str(e)}{Style.RESET_ALL}")
+            raise e
     
     def query(self, query: str, category: str = None, filters: dict = None) -> Tuple[str, dict]:
         """

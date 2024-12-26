@@ -1,83 +1,123 @@
-"""Module for handling output operations."""
+"""Output handling module for file traversal results."""
 
-from datetime import datetime
-from typing import List, Dict
 import os
-from colorama import init, Fore, Style
+import json
+from datetime import datetime
+from typing import Dict, List
+from rich.console import Console
+from rich.table import Table
 
-# Initialize colorama for console output only
-init()
+console = Console()
 
-def write_to_file(paths_data: Dict) -> str:
+def write_to_file(traversal_results: Dict) -> str:
     """
-    Write the collected paths to a timestamped output file.
+    Write traversal results to a file with detailed analysis.
     
     Args:
-        paths_data (Dict): Dictionary containing paths and statistics
+        traversal_results: Dictionary containing paths, stats, and analysis results
         
     Returns:
-        str: The name of the output file that was created.
+        str: Path to the output file
     """
     # Create output directory if it doesn't exist
-    output_dir = "output"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    output_dir = os.path.join("output", "file_paths")
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Generate timestamped filename
+    # Generate output filename with timestamp
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = os.path.join(output_dir, f"file_paths_{timestamp}.txt")
     
-    # Extract data
-    all_paths = paths_data["all_paths"]
-    empty_folders = paths_data["empty_folders"]
-    readme_files = paths_data["readme_files"]
-    stats = paths_data["stats"]
+    # Extract components
+    paths = traversal_results['paths']
+    stats = traversal_results['stats']
+    analysis = traversal_results['analysis']
     
-    # Group files by directory to count batches and single files
-    batches = {}
-    for path in all_paths:
-        if path in empty_folders or path in readme_files:
-            continue
-        directory = os.path.dirname(path)
-        batches.setdefault(directory, []).append(path)
-    
-    # Count single files and batches
-    single_files = sum(1 for files in batches.values() if len(files) == 1)
-    batch_count = sum(1 for files in batches.values() if len(files) > 1)
-    
-    # Write paths to file with summary
-    with open(output_file, "w", encoding="utf-8") as f:
-        # Write summary header
-        f.write("File Path Summary\n")
-        f.write("-" * 50 + "\n\n")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        # Write header
+        f.write("=== File Path Analysis Report ===\n")
+        f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         
         # Write statistics
-        f.write(f"Total Files Found: {stats['total_files']}\n")
-        f.write(f"Files to Process: {stats['processed_files']}\n")
-        f.write(f"Batches (multiple files): {batch_count}\n")
-        f.write(f"Single Files: {single_files}\n")
-        f.write(f"Empty Folders: {stats['empty_folders']}\n")
-        f.write(f"README Files: {stats['readme_files']}\n")
-        f.write("\n" + "-" * 50 + "\n\n")
+        f.write("=== Statistics ===\n")
+        f.write(f"Total Files: {stats['total_files']}\n")
+        f.write(f"Total Directories: {stats['total_dirs']}\n")
+        f.write(f"Deepest Nesting Level: {stats['deepest_nesting']}\n\n")
         
-        # Write paths in order: empty folders, READMEs, then all other files
-        for path in empty_folders:
-            f.write(f"{path}\n")
+        # Write file type distribution
+        f.write("=== File Type Distribution ===\n")
+        for ext, count in stats['file_types'].items():
+            f.write(f"{ext}: {count} files\n")
+        f.write("\n")
+        
+        # Write largest files
+        f.write("=== Largest Files ===\n")
+        for path, size in stats['largest_files']:
+            size_mb = size / (1024 * 1024)
+            f.write(f"{path}: {size_mb:.2f} MB\n")
+        f.write("\n")
+        
+        # Write detailed file listing with analysis
+        f.write("=== Detailed File Analysis ===\n")
+        for file_info in sorted(paths, key=lambda x: x['path']):
+            path = file_info['path']
+            f.write(f"\nFile: {path}\n")
+            f.write(f"Size: {file_info['size']} bytes\n")
+            f.write(f"Type: {file_info['type']}\n")
+            f.write(f"Nesting Level: {file_info['nesting_level']}\n")
             
-        for path in readme_files:
-            f.write(f"{path}\n")
+            # Include code analysis if available
+            if path in analysis:
+                f.write("\nCode Analysis:\n")
+                
+                # Write code statistics
+                stats = analysis[path]['stats']
+                if stats:
+                    f.write("  Statistics:\n")
+                    f.write(f"  - Complexity: {stats.get('complexity', 'N/A')}\n")
+                    f.write(f"  - Functions: {stats.get('function_count', 'N/A')}\n")
+                    f.write(f"  - Classes: {stats.get('class_count', 'N/A')}\n")
+                    f.write(f"  - Lines of Code: {stats.get('lines_of_code', 'N/A')}\n")
+                    f.write(f"  - Comment Lines: {stats.get('comment_lines', 'N/A')}\n")
+                    f.write(f"  - Nesting Depth: {stats.get('nesting_depth', 'N/A')}\n")
+                
+                # Write potential issues
+                issues = analysis[path]['issues']
+                if issues:
+                    f.write("\n  Potential Issues:\n")
+                    for issue in issues:
+                        f.write(f"  - {issue}\n")
             
-        for path in all_paths:
-            if path not in empty_folders and path not in readme_files:
-                f.write(f"{path}\n")
+            f.write("\n" + "-"*50 + "\n")
     
-    # Print summary to console (keeping colors only for console output)
-    print(f"\nSummary:")
-    print(f"Total Files Found: {Fore.WHITE}{stats['total_files']}{Style.RESET_ALL}")
-    print(f"Files to Process: {Fore.GREEN}{stats['processed_files']}{Style.RESET_ALL}")
-    print(f"Batches (multiple files): {Fore.CYAN}{batch_count}{Style.RESET_ALL}")
-    print(f"Single Files: {Fore.YELLOW}{single_files}{Style.RESET_ALL}")
-    print(f"Empty Folders: {Fore.RED}{stats['empty_folders']}{Style.RESET_ALL}")
-    print(f"README Files: {Fore.BLUE}{stats['readme_files']}{Style.RESET_ALL}")
+    # Create a summary table for display
+    table = Table(title="Analysis Summary")
+    table.add_column("Category", style="cyan")
+    table.add_column("Value", style="green")
+    
+    table.add_row("Total Files", str(stats['total_files']))
+    table.add_row("Total Directories", str(stats['total_dirs']))
+    table.add_row("Deepest Nesting", str(stats['deepest_nesting']))
+    table.add_row("File Types", str(len(stats['file_types'])))
+    
+    # Count files with issues
+    files_with_issues = sum(1 for file_analysis in analysis.values() if file_analysis['issues'])
+    table.add_row("Files with Issues", str(files_with_issues))
+    
+    console.print(table)
+    
+    # Save metadata
+    metadata = {
+        'timestamp': timestamp,
+        'stats': stats,
+        'file_types': list(stats['file_types'].keys()),
+        'analysis_summary': {
+            'total_files_analyzed': len(analysis),
+            'files_with_issues': files_with_issues
+        }
+    }
+    
+    metadata_file = os.path.join(output_dir, f"metadata_{timestamp}.json")
+    with open(metadata_file, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2)
     
     return output_file 

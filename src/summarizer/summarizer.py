@@ -1,14 +1,14 @@
-#!/usr/bin/env python3
+"""Module for generating code summaries using OpenAI."""
 
 import os
-import openai
-import re
+import json
 import time
 from datetime import datetime
-from typing import List, Dict, Tuple
-from dotenv import load_dotenv
+from typing import Dict, List, Tuple, Optional
 from colorama import init, Fore, Style
-import json
+import openai
+from dotenv import load_dotenv
+from ..file_traversal.analyzer import CodeAnalyzer
 
 # Initialize colorama
 init()
@@ -17,7 +17,7 @@ init()
 load_dotenv()
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Available models with GPT-3.5 as default
+# Available models
 MODELS = {
     "": {"name": "gpt-3.5-turbo", "display": "GPT-3.5 Turbo (Default)"},
     "1": {"name": "gpt-4", "display": "GPT-4"},
@@ -161,85 +161,65 @@ def show_spinner(duration: float):
         i += 1
         time.sleep(0.1)
 
-def summarize_file(file_path: str, model: str) -> Tuple[str, bool, dict]:
+def summarize_file(file_path: str, model: str = "gpt-3.5-turbo", max_tokens: int = 1200) -> Tuple[str, Dict]:
     """
-    Summarize the contents of a file using OpenAI.
-    Returns a tuple of (summary, success, usage_stats).
+    Generate a detailed summary of a code file.
+    
+    Args:
+        file_path: Path to the file to summarize
+        model: OpenAI model to use
+        max_tokens: Maximum tokens for the response
+        
+    Returns:
+        Tuple containing the summary and token usage statistics
     """
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        # Read file content
+        with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-
-        # Prepare the messages for the chat completion
+            
+        # Analyze the code
+        analyzer = CodeAnalyzer()
+        issues, stats = analyzer.analyze_file(file_path, content)
+        analysis_results = {
+            'stats': stats,
+            'issues': issues
+        }
+        
+        # Generate the prompt with analysis results
+        prompt = generate_summary_prompt(file_path, content, analysis_results)
+        
+        # Get summary from OpenAI
         messages = [
             {
-                "role": "system", 
-                "content": """You are a technical documentation expert that summarizes code files.
-                Analyze the code thoroughly and provide a comprehensive summary with the following sections:
-
-                ## 1. Main Purpose
-                - Core functionality and responsibility
-                - Role in the larger system
-                - Key features or capabilities
-
-                ## 2. Technical Implementation
-                - Architecture and design patterns used
-                - Important algorithms or logic
-                - State management approach
-                - Error handling strategy
-
-                ## 3. Dependencies and Requirements
-                - External libraries and packages
-                - Internal module dependencies
-                - Required configurations or environment setup
-                - API integrations
-
-                ## 4. Code Structure
-                - Key classes, functions, or components
-                - Important interfaces or types
-                - Data flow and component interactions
-                - Notable code patterns or techniques
-
-                ## 5. Best Practices and Potential Improvements
-                Only include this section if the code deviates from established best practices in:
-                - Security (e.g., input validation, authentication)
-                - Performance (e.g., optimization opportunities)
-                - Accessibility (e.g., ARIA compliance)
-                - Error Handling (e.g., proper error boundaries)
-                - Testing (e.g., missing test coverage)
-                - Code Organization (e.g., separation of concerns)
-                Do not suggest subjective improvements or minor style changes.
-
-                ## 6. Usage Examples
-                - Typical use cases
-                - Code examples if relevant
-                - Important configuration options
-                - Common patterns of usage
-
-                Format your response in markdown and be specific to the code being analyzed.
-                Focus on technical accuracy and practical insights."""
+                "role": "system",
+                "content": "You are a technical documentation expert that creates detailed and accurate code summaries."
             },
-            {"role": "user", "content": f"Please analyze and summarize this file:\n\n{content}"}
+            {
+                "role": "user",
+                "content": prompt
+            }
         ]
-
-        # Call OpenAI API with new client interface
+        
         response = client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=1200,  # Increased token limit for more detailed summaries
-            temperature=0.5,   # Reduced temperature for more focused responses
+            temperature=0.5,
+            max_tokens=max_tokens
         )
         
-        usage_stats = {
-            "model": response.model,
-            "total_tokens": response.usage.total_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "prompt_tokens": response.usage.prompt_tokens
+        summary = response.choices[0].message.content
+        usage = {
+            'prompt_tokens': response.usage.prompt_tokens,
+            'completion_tokens': response.usage.completion_tokens,
+            'total_tokens': response.usage.total_tokens
         }
         
-        return response.choices[0].message.content.strip(), True, usage_stats
+        return summary, usage
+        
     except Exception as e:
-        return f"Error summarizing file: {e}", False, {}
+        print(f"{Fore.RED}Error summarizing {file_path}: {str(e)}{Style.RESET_ALL}")
+        return None, None
 
 def save_summary(output_dir: str, file_path: str, summary: str, success: bool, usage_stats: dict = None):
     """Save the summary maintaining the original directory structure."""
@@ -391,6 +371,69 @@ def process_all_files(batches: Dict[str, List[str]], output_dir: str, model: str
     print(f"Total Tokens Used: {total_tokens}")
     
     return total_successful, total_failed, total_tokens
+
+def generate_summary_prompt(file_path: str, content: str, analysis_results: Dict = None) -> str:
+    """Generate a detailed prompt for the file summary."""
+    prompt = f"""Analyze the following code file and provide a detailed summary.
+File: {file_path}
+
+Please structure the summary in the following sections:
+
+1. Main Purpose
+- Brief overview of the file's primary function and responsibility
+- Key features or functionality provided
+
+2. Technical Implementation
+- Core classes, functions, or components
+- Important algorithms or logic
+- Design patterns used
+
+3. Dependencies and Requirements
+- External libraries and imports
+- System requirements
+- Configuration needs
+
+4. Code Structure
+- File organization
+- Key sections and their purposes
+- Important variables and constants
+
+5. Usage Examples
+- How to use the main functionality
+- Example code snippets if applicable
+- API endpoints or interfaces
+
+6. Best Practices and Potential Improvements
+- Areas following good practices
+- Suggestions for improvement (only if deviating from best practices)
+- Performance considerations
+
+7. Code Analysis Results
+"""
+
+    if analysis_results:
+        prompt += "\nStatic Analysis:\n"
+        
+        # Add code statistics
+        stats = analysis_results.get('stats', {})
+        if stats:
+            prompt += "- Complexity Score: {}\n".format(stats.get('complexity', 'N/A'))
+            prompt += "- Function Count: {}\n".format(stats.get('function_count', 'N/A'))
+            prompt += "- Class Count: {}\n".format(stats.get('class_count', 'N/A'))
+            prompt += "- Lines of Code: {}\n".format(stats.get('lines_of_code', 'N/A'))
+            prompt += "- Comment Lines: {}\n".format(stats.get('comment_lines', 'N/A'))
+            prompt += "- Maximum Nesting Depth: {}\n".format(stats.get('nesting_depth', 'N/A'))
+        
+        # Add identified issues
+        issues = analysis_results.get('issues', [])
+        if issues:
+            prompt += "\nPotential Issues:\n"
+            for issue in issues:
+                prompt += f"- {issue}\n"
+    
+    prompt += f"\nCode Content:\n{content}\n"
+    
+    return prompt
 
 def main():
     print_banner()
