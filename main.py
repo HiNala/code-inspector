@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
-from src.file_traversal import get_file_paths
-from src.output_handler import write_to_file
+from src.file_traversal.traversal import get_file_paths
+from src.file_traversal.output import write_to_file
 from colorama import init, Fore, Style
 import os
 import sys

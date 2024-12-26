@@ -6,29 +6,33 @@ import subprocess
 from colorama import init, Fore, Style
 
 # Initialize colorama
-init(autoreset=True)
+init()
 
 def run_script(script_path: str, description: str) -> bool:
     """Run a Python script and return True if successful."""
-    print(f"\n{Fore.CYAN}Running {description}...{Style.RESET_ALL}")
     try:
-        result = subprocess.run([sys.executable, script_path], check=True)
-        if result.returncode == 0:
-            print(f"{Fore.GREEN}✓ {description} completed successfully{Style.RESET_ALL}")
-            return True
-        else:
-            print(f"{Fore.RED}✗ {description} failed with return code {result.returncode}{Style.RESET_ALL}")
-            return False
+        result = subprocess.run(
+            [sys.executable, script_path],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        print(result.stdout)
+        if result.stderr:
+            print(f"{Fore.YELLOW}Warnings:{Style.RESET_ALL}\n{result.stderr}")
+        print(f"\n{Fore.GREEN}✓ {description} completed successfully{Style.RESET_ALL}")
+        return True
     except subprocess.CalledProcessError as e:
-        print(f"{Fore.RED}✗ {description} failed with error: {str(e)}{Style.RESET_ALL}")
+        print(f"{Fore.RED}✗ Error running {description}:{Style.RESET_ALL}")
+        print(e.stderr)
         return False
     except Exception as e:
-        print(f"{Fore.RED}✗ Error running {description}: {str(e)}{Style.RESET_ALL}")
+        print(f"{Fore.RED}✗ Unexpected error running {description}: {str(e)}{Style.RESET_ALL}")
         return False
 
 def main():
     # Print welcome banner
-    print("\n╭──────────────────���───────────────╮")
+    print("\n╭──────────────────────────────────╮")
     print("│ Code Analysis Pipeline Runner    │")
     print("╰──────────────────────────────────╯")
     
@@ -40,11 +44,11 @@ def main():
             "description": "Part 1: File Path Collection"
         },
         {
-            "path": os.path.join(base_dir, "summarize_files.py"),
+            "path": os.path.join(base_dir, "summarize.py"),
             "description": "Part 2: File Summarization"
         },
         {
-            "path": os.path.join(base_dir, "rag_query_tool", "query_interface.py"),
+            "path": os.path.join(base_dir, "query.py"),
             "description": "Part 3: Interactive Query Interface"
         }
     ]
