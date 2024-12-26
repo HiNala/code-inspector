@@ -1,186 +1,179 @@
-"""Text-to-Speech functionality using ElevenLabs with pyttsx3 fallback."""
+"""Text-to-Speech functionality with caching and performance optimizations."""
 
 import os
-import time
+import json
 import hashlib
-import pickle
+import shutil
 from pathlib import Path
-from typing import Optional, Dict, Union
+from typing import Optional, Dict
+from dotenv import load_dotenv
 from elevenlabs import generate, play, set_api_key, voices
-import pyttsx3
 from colorama import Fore, Style
 from halo import Halo
-from dotenv import load_dotenv
-import shutil
+import threading
+import time
 
 # Load environment variables
 load_dotenv()
 
 # Constants
-MAX_CACHE_SIZE_MB = 500  # Maximum TTS cache size in MB
 CACHE_DIR = Path("cache/tts")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MAX_CACHE_SIZE_MB = int(os.getenv("TTS_CACHE_SIZE", "100"))  # Maximum cache size in MB
+MAX_RETRIES = 3
+RETRY_DELAY = 2
 
 class TTSManager:
-    def __init__(self, provider: str = "elevenlabs", voice_id: Optional[str] = None):
-        self.provider = provider
-        self.voice_id = voice_id
-        self.cache = {}
-        self.load_cache()
-        
-        if provider == "elevenlabs":
-            api_key = os.getenv("ELEVENLABS_API_KEY")
-            if not api_key:
-                raise ValueError("ElevenLabs API key not found in environment variables")
-            set_api_key(api_key)
-        elif provider == "local":
-            self.engine = pyttsx3.init()
+    def __init__(self):
+        """Initialize TTS manager with caching."""
+        self.api_key = os.getenv("ELEVENLABS_API_KEY")
+        if not self.api_key:
+            raise ValueError("ELEVENLABS_API_KEY not found in environment variables")
             
-    def load_cache(self):
-        """Load the TTS cache and manage its size."""
-        cache_file = CACHE_DIR / "cache_index.pkl"
-        if cache_file.exists():
+        set_api_key(self.api_key)
+        self.cache_dir = CACHE_DIR
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_lock = threading.Lock()
+        self.cache_info = self._load_cache_info()
+        
+    def _load_cache_info(self) -> Dict:
+        """Load cache information from disk."""
+        cache_info_file = self.cache_dir / "cache_info.json"
+        if cache_info_file.exists():
             try:
-                with open(cache_file, "rb") as f:
-                    self.cache = pickle.load(f)
+                with open(cache_info_file, "r") as f:
+                    return json.load(f)
             except Exception as e:
-                print(f"{Fore.YELLOW}Warning: Could not load TTS cache: {str(e)}{Style.RESET_ALL}")
-                self.cache = {}
-                
-        # Check cache size and clean if necessary
-        self._manage_cache_size()
+                print(f"{Fore.YELLOW}Warning: Could not load cache info: {str(e)}{Style.RESET_ALL}")
+        return {"files": {}, "total_size": 0}
         
-    def save_cache(self):
-        """Save the cache index."""
+    def _save_cache_info(self):
+        """Save cache information to disk."""
         try:
-            cache_file = CACHE_DIR / "cache_index.pkl"
-            with open(cache_file, "wb") as f:
-                pickle.dump(self.cache, f)
+            with open(self.cache_dir / "cache_info.json", "w") as f:
+                json.dump(self.cache_info, f)
         except Exception as e:
-            print(f"{Fore.YELLOW}Warning: Could not save TTS cache: {str(e)}{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Warning: Could not save cache info: {str(e)}{Style.RESET_ALL}")
             
+    def _get_cache_key(self, text: str, voice: str) -> str:
+        """Generate cache key for text and voice combination."""
+        return hashlib.md5(f"{text}:{voice}".encode()).hexdigest()
+        
     def _manage_cache_size(self):
-        """Ensure cache doesn't exceed MAX_CACHE_SIZE_MB."""
-        total_size = 0
-        cache_files = []
-        
-        # Get all audio files with their sizes and timestamps
-        for file in CACHE_DIR.glob("*.mp3"):
-            if file.name == "cache_index.pkl":
-                continue
-            stats = file.stat()
-            total_size += stats.st_size
-            cache_files.append((file, stats.st_mtime))
-            
-        # Convert to MB
-        total_size_mb = total_size / (1024 * 1024)
-        
-        # If cache exceeds limit, remove oldest files
-        if total_size_mb > MAX_CACHE_SIZE_MB:
-            print(f"{Fore.YELLOW}Cache size ({total_size_mb:.1f}MB) exceeds limit ({MAX_CACHE_SIZE_MB}MB). Cleaning...{Style.RESET_ALL}")
-            cache_files.sort(key=lambda x: x[1])  # Sort by modification time
-            
-            for file, _ in cache_files:
-                if total_size_mb <= MAX_CACHE_SIZE_MB:
-                    break
-                    
-                file_size = file.stat().st_size / (1024 * 1024)
-                file.unlink()
-                total_size_mb -= file_size
+        """Ensure cache doesn't exceed maximum size."""
+        with self.cache_lock:
+            while self.cache_info["total_size"] > MAX_CACHE_SIZE_MB * 1024 * 1024:
+                # Remove oldest files until under limit
+                oldest_file = min(
+                    self.cache_info["files"].items(),
+                    key=lambda x: x[1]["timestamp"]
+                )[0]
                 
-                # Remove from cache index
-                cache_key = file.stem
-                if cache_key in self.cache:
-                    del self.cache[cache_key]
+                try:
+                    file_path = self.cache_dir / oldest_file
+                    if file_path.exists():
+                        file_size = file_path.stat().st_size
+                        file_path.unlink()
+                        self.cache_info["total_size"] -= file_size
+                        del self.cache_info["files"][oldest_file]
+                except Exception as e:
+                    print(f"{Fore.YELLOW}Warning: Error removing cache file: {str(e)}{Style.RESET_ALL}")
                     
-            print(f"{Fore.GREEN}Cache cleaned. New size: {total_size_mb:.1f}MB{Style.RESET_ALL}")
-            self.save_cache()
+            self._save_cache_info()
             
-    def generate_speech(self, text: str, voice_id: Optional[str] = None) -> Optional[str]:
+    def generate_speech(self, text: str, voice: str = "Bella") -> bool:
         """Generate speech from text with caching and error handling."""
         try:
-            # Generate cache key
-            text_hash = hashlib.md5(text.encode()).hexdigest()
-            voice = voice_id or self.voice_id or "default"
-            cache_key = f"{text_hash}_{voice}_{self.provider}"
+            cache_key = self._get_cache_key(text, voice)
+            cache_file = self.cache_dir / f"{cache_key}.mp3"
             
-            # Check cache
-            if cache_key in self.cache:
-                cache_path = CACHE_DIR / f"{cache_key}.mp3"
-                if cache_path.exists():
-                    return str(cache_path)
+            # Check cache first
+            with self.cache_lock:
+                if cache_file.exists():
+                    print(f"{Fore.GREEN}Using cached audio{Style.RESET_ALL}")
+                    play(cache_file.read_bytes())
+                    return True
                     
             # Generate new audio
             with Halo(text="Generating speech...", spinner="dots") as spinner:
-                if self.provider == "elevenlabs":
+                for attempt in range(MAX_RETRIES):
                     try:
-                        audio = generate(
-                            text=text,
-                            voice=voice_id or self.voice_id,
-                            model="eleven_monolingual_v1"
-                        )
-                    except Exception as e:
-                        spinner.fail(f"ElevenLabs API error: {str(e)}")
-                        # Fallback to local TTS
-                        print(f"{Fore.YELLOW}Falling back to local TTS...{Style.RESET_ALL}")
-                        self.provider = "local"
-                        self.engine = pyttsx3.init()
-                        return self.generate_speech(text)
+                        audio = generate(text=text, voice=voice)
                         
-                elif self.provider == "local":
-                    self.engine.save_to_file(text, str(CACHE_DIR / f"{cache_key}.mp3"))
-                    self.engine.runAndWait()
-                    
-                spinner.succeed("Speech generated successfully")
-                
-            # Save to cache
-            output_path = CACHE_DIR / f"{cache_key}.mp3"
-            if self.provider == "elevenlabs":
-                with open(output_path, "wb") as f:
-                    f.write(audio)
-                    
-            self.cache[cache_key] = str(output_path)
-            self.save_cache()
-            self._manage_cache_size()
-            
-            return str(output_path)
-            
+                        # Save to cache
+                        with self.cache_lock:
+                            cache_file.write_bytes(audio)
+                            file_size = cache_file.stat().st_size
+                            self.cache_info["files"][cache_file.name] = {
+                                "timestamp": time.time(),
+                                "size": file_size
+                            }
+                            self.cache_info["total_size"] += file_size
+                            self._manage_cache_size()
+                            
+                        # Play audio
+                        play(audio)
+                        spinner.succeed("Speech generated successfully")
+                        return True
+                        
+                    except Exception as e:
+                        if attempt == MAX_RETRIES - 1:
+                            spinner.fail(f"Failed to generate speech: {str(e)}")
+                            return False
+                        print(f"{Fore.YELLOW}Retry {attempt + 1}/{MAX_RETRIES}: {str(e)}{Style.RESET_ALL}")
+                        time.sleep(RETRY_DELAY)
+                        
         except Exception as e:
             print(f"{Fore.RED}Error generating speech: {str(e)}{Style.RESET_ALL}")
-            return None
+            return False
+            
+    def get_available_voices(self) -> list:
+        """Get list of available voices with error handling."""
+        try:
+            return [voice.name for voice in voices()]
+        except Exception as e:
+            print(f"{Fore.RED}Error getting voices: {str(e)}{Style.RESET_ALL}")
+            return ["Bella"]  # Return default voice as fallback
             
     def cleanup(self):
         """Clean up resources."""
-        if self.provider == "local" and hasattr(self, 'engine'):
-            self.engine.stop()
+        try:
+            # Save final cache state
+            self._save_cache_info()
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: Error during cleanup: {str(e)}{Style.RESET_ALL}")
             
-def get_available_voices() -> Dict[str, str]:
-    """Get available voices with error handling."""
+def read_text_aloud(text: str, voice: Optional[str] = None) -> bool:
+    """Convenience function to read text aloud."""
     try:
-        voice_list = voices()
-        return {voice.name: voice.voice_id for voice in voice_list}
-    except Exception as e:
-        print(f"{Fore.YELLOW}Could not fetch ElevenLabs voices: {str(e)}{Style.RESET_ALL}")
-        print("Using local TTS voices instead...")
-        engine = pyttsx3.init()
-        return {voice.name: voice.id for voice in engine.getProperty('voices')}
-        
-def read_text_aloud(text: str, voice_id: Optional[str] = None) -> bool:
-    """Read text aloud with error handling and fallback."""
-    try:
-        tts = TTSManager(provider="elevenlabs", voice_id=voice_id)
-        audio_path = tts.generate_speech(text)
-        
-        if audio_path:
-            if os.path.exists(audio_path):
-                play(audio_path)
-                return True
-                
-        return False
-        
-    except Exception as e:
-        print(f"{Fore.RED}Error reading text: {str(e)}{Style.RESET_ALL}")
-        return False
+        manager = TTSManager()
+        return manager.generate_speech(text, voice or "Bella")
     finally:
-        if 'tts' in locals():
-            tts.cleanup() 
+        if 'manager' in locals():
+            manager.cleanup()
+            
+def select_voice() -> Optional[str]:
+    """Select a voice interactively."""
+    try:
+        manager = TTSManager()
+        voices = manager.get_available_voices()
+        
+        print(f"\n{Fore.CYAN}Available voices:{Style.RESET_ALL}")
+        for i, voice in enumerate(voices, 1):
+            print(f"{i}. {voice}")
+            
+        while True:
+            try:
+                choice = input(f"\n{Fore.GREEN}Select a voice (1-{len(voices)}): {Style.RESET_ALL}")
+                index = int(choice) - 1
+                if 0 <= index < len(voices):
+                    return voices[index]
+                print(f"{Fore.RED}Invalid choice. Please try again.{Style.RESET_ALL}")
+            except ValueError:
+                print(f"{Fore.RED}Invalid input. Please enter a number.{Style.RESET_ALL}")
+                
+    except Exception as e:
+        print(f"{Fore.RED}Error selecting voice: {str(e)}{Style.RESET_ALL}")
+        return None
+    finally:
+        if 'manager' in locals():
+            manager.cleanup() 
